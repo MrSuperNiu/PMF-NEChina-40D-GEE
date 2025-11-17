@@ -1,0 +1,295 @@
+// 2005 年数据，film‐on：5月，film‐off：10月 820_3
+var start_1 = '1995-05-01';
+var end_1   = '1995-05-30'; 
+var start_2 = '1995-09-01';  
+var end_2   = '1995-11-30'; 
+
+// 更新可视化参数：Landsat 7 自然色合成（红：SR_B3，绿：SR_B2，蓝：SR_B1）
+var rgbVis = {min: 0.0, max: 0.3, gamma: 1.4, bands: ['SR_B3', 'SR_B2', 'SR_B1']};
+var ndviParams = {min: -1, max: 1, palette: ['blue', 'white', 'green']}; 
+var elevationVis = {min: 0.0, max: 4000.0, palette: ['0000ff', '00ffff', 'ffff00', 'ff0000', 'ffffff']};
+
+var grid_id = 982;
+var subgrid_id = 1;
+var geometry = ee.FeatureCollection(Grid_05_ID).filter(ee.Filter.eq('Grid',grid_id)).filter(ee.Filter.eq('SubGrid',subgrid_id)).geometry();
+
+Map.centerObject(geometry, 12);  // 缩放到6级
+
+var NonDM = NonPMF_982_1;
+var DM = PMF_982_1;
+
+// ---------------------------------------------------------------------------
+// 云掩膜函数：针对 Landsat 7 Collection 2 Level‑2 数据
+// 使用 QA_PIXEL 波段，屏蔽云（bit 3）和云阴影（bit 5）
+function maskL7sr(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudShadowBitMask = 1 << 3;
+  var cloudsBitMask = 1 << 5;
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+              .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  // Collection 2 Level‑2 数据：波段乘以 0.0000275 再加 -0.2
+  var opticalBands = image.select(['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7'])
+                          .multiply(0.0000275).add(-0.2);
+  return opticalBands.updateMask(mask);
+}
+
+// ---------------------------------------------------------------------------
+// 加载并补条带函数：使用 Landsat 7 Collection 2 Level‑2 数据集
+// 对于指定时间段，先生成主合成影像（primary），再生成备份合成影像（backup）；
+// 然后用 primary.unmask(backup) 实现缺失区域的补充
+function load_data_gapFill(primaryStart, primaryEnd, backupStart, backupEnd, table_geo) {
+  // 主影像（2005 年）
+  var primary = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+                    .filterBounds(table_geo)
+                    .filterDate(primaryStart, primaryEnd)
+                    .filter(ee.Filter.lt('CLOUD_COVER', 80))
+                    .map(maskL7sr)
+                    .select(['SR_B4','SR_B3','SR_B2','SR_B1','SR_B5','SR_B7'])
+                    .median();
+  return primary // .unmask(backup);
+}
+
+// 获取 film‐on 与 film‐off 影像（自动补充条带缺失）
+var image_1 = load_data_gapFill(start_1, end_1, start_1, end_1, geometry);
+var image_2 = load_data_gapFill(start_2, end_2, start_2, end_2, geometry);
+
+// 在地图上添加影像图层
+Map.addLayer(image_1.clip(geometry), rgbVis, 'film_on_' + grid_id + '_' + subgrid_id);
+Map.addLayer(image_2.clip(geometry), rgbVis, 'film_off_' + grid_id + '_' + subgrid_id);
+
+// ---------------------------
+// Building Feature Function
+// ---------------------------
+
+// --- 光谱指数计算 ---
+function cal_ndvi_L5(data){
+  var ndvi0 = data.expression('(nir-red)/(nir+red)',{
+    'nir': data.select('SR_B4'),
+    'red': data.select('SR_B3')
+  });
+  var ndvi = ee.Image(ndvi0);
+  return ndvi;
+}
+
+function cal_ndbi_L5(data){
+  var ndbi0 = data.expression('(swir1-nir)/(nir+swir1)',{
+    'nir':  data.select('SR_B4'),
+    'swir1':data.select('SR_B5')
+  });
+  var ndbi = ee.Image(ndbi0);
+  return ndbi;
+}
+
+function cal_rpgi_L5(data){
+  var rpgi0 = data.expression('100*blue/(1-(nir+blue+green))/3',{
+    'blue': data.select('SR_B1'),
+    'nir':  data.select('SR_B4'),
+    'green':data.select('SR_B2')
+  });
+  var rpgi = ee.Image(rpgi0);
+  return rpgi;
+}
+
+function cal_savi_L5(data){
+  var savi0 = data.expression('1.5*(nir-red)/(nir+red+0.5)',{
+    'nir': data.select('SR_B4'),
+    'red': data.select('SR_B3')
+  });
+  var savi = ee.Image(savi0);
+  return savi;
+}
+
+function cal_apgi_L5(data){
+  var apgi0 = data.expression('100*aerosols*red*(2*nir-red-swir2)/(2*nir+red+swir2)',{
+    // L5 无 aerosol，用蓝光近似
+    'aerosols': data.select('SR_B1'),
+    'red':      data.select('SR_B3'),
+    'nir':      data.select('SR_B4'),
+    'swir2':    data.select('SR_B7')
+  });
+  var apgi = ee.Image(apgi0);
+  return apgi;
+}
+
+function cal_pghi_L5(data){
+  var pghi0 = data.expression('blue/swir2',{
+    'blue':  data.select('SR_B1'),
+    'swir2': data.select('SR_B7')
+  });
+  var pghi = ee.Image(pghi0);
+  return pghi;
+}
+
+function cal_pgi_L5(data){
+  var pgi0 = data.expression('(100*(blue*(nir-red)))/(1-(blue+green+nir))/3',{
+    'blue':  data.select('SR_B1'),
+    'nir':   data.select('SR_B4'),
+    'red':   data.select('SR_B3'),
+    'green': data.select('SR_B2')
+  });
+  var pgi = ee.Image(pgi0);
+  return pgi;
+}
+
+function cal_pmli_L5(data){
+  var pmli0 = data.expression('(swir1-red)/(swir1+red)',{
+    'swir1': data.select('SR_B5'),
+    'red':   data.select('SR_B3')
+  });
+  var pmli = ee.Image(pmli0);
+  return pmli;
+}
+
+function cal_mndwi_L5(data){
+  var mndwi0 = data.expression('(green-swir1)/(swir1+green)',{
+    'swir1': data.select('SR_B5'),
+    'green': data.select('SR_B2')
+  });
+  var mndwi = ee.Image(mndwi0);
+  return mndwi;
+}
+
+// --- GLCM 纹理特征 ---
+// 使用 SR_B1 作为计算纹理的基础（你也可以根据需要选择其他波段）
+function get_GLCM(data) {
+  var asm = data.int32().glcmTexture({size: 4}).select('SR_B1_asm');
+  var contrast = data.int32().glcmTexture({size: 4}).select('SR_B1_contrast');
+  var corr = data.int32().glcmTexture({size: 4}).select('SR_B1_corr');
+  var vari = data.int32().glcmTexture({size: 4}).select('SR_B1_var');
+  var idm = data.int32().glcmTexture({size: 4}).select('SR_B1_idm');
+  var savg = data.int32().glcmTexture({size: 4}).select('SR_B1_savg');
+  var ent = data.int32().glcmTexture({size: 4}).select('SR_B1_ent');
+  var diss = data.int32().glcmTexture({size: 4}).select('SR_B1_diss');
+  
+  return asm.addBands(contrast)
+            .addBands(corr)
+            .addBands(vari)
+            .addBands(idm)
+            .addBands(ent)
+            .addBands(savg)
+            .addBands(diss);
+}
+
+// 计算各个影像的光谱指数
+var ndvi1 = cal_ndvi_L5(image_1).rename('ndvi1');
+var ndbi1 = cal_ndbi_L5(image_1).rename('ndbi1');
+var mndwi1 = cal_mndwi_L5(image_1).rename('mndwi1');
+var savi1 = cal_savi_L5(image_1).rename('savi1');
+var apgi1 = cal_apgi_L5(image_1).rename('apgi1');
+var pghi1 = cal_pghi_L5(image_1).rename('pghi1');
+var pgi1 = cal_pgi_L5(image_1).rename('pgi1');
+var pmli1 = cal_pmli_L5(image_1).rename('pmli1');
+var rpgi1 = cal_rpgi_L5(image_1).rename('rpgi1');
+
+var ndvi2 = cal_ndvi_L5(image_2).rename('ndvi2');
+var ndbi2 = cal_ndbi_L5(image_2).rename('ndbi2');
+var mndwi2 = cal_mndwi_L5(image_2).rename('mndwi2');
+var savi2 = cal_savi_L5(image_2).rename('savi2');
+var apgi2 = cal_apgi_L5(image_2).rename('apgi2');
+var pghi2 = cal_pghi_L5(image_2).rename('pghi2');
+var pgi2 = cal_pgi_L5(image_2).rename('pgi2');
+var pmli2 = cal_pmli_L5(image_2).rename('pmli2');
+var rpgi2 = cal_rpgi_L5(image_2).rename('rpgi2');
+
+// 计算纹理特征
+var glcm_1 = get_GLCM(image_1).select('SR_B1_asm','SR_B1_contrast','SR_B1_corr','SR_B1_var','SR_B1_idm','SR_B1_savg','SR_B1_ent','SR_B1_diss');
+var glcm_2 = get_GLCM(image_2).select('SR_B1_asm','SR_B1_contrast','SR_B1_corr','SR_B1_var','SR_B1_idm','SR_B1_savg','SR_B1_ent','SR_B1_diss');
+
+// ---------------------------
+// 样本数据（NonDM 与 DM）处理
+// ---------------------------
+var NonDM_a = ee.FeatureCollection(NonDM);
+var DM_a = ee.FeatureCollection(DM);
+
+var addproperty0 = function(feature) { return feature.set('landcover', 0); };
+var addproperty1 = function(feature) { return feature.set('landcover', 1); };
+
+var Point_NonDM_b = NonDM_a.map(addproperty0);
+var Point_DM_b = DM_a.map(addproperty1);
+
+// 随机分割训练与验证样本（70% 训练，30% 验证）
+var NonDM_c = Point_NonDM_b.randomColumn();
+var DM_c = Point_DM_b.randomColumn();
+
+var split = 0.7;
+var training_NonDM_c = NonDM_c.filter(ee.Filter.lt('random', split));
+var validation_NonDM_c = NonDM_c.filter(ee.Filter.gte('random', split));
+var training_DM_c = DM_c.filter(ee.Filter.lt('random', split));
+var validation_DM_c = DM_c.filter(ee.Filter.gte('random', split));
+
+var training_mix = ee.FeatureCollection(training_NonDM_c).merge(training_DM_c);
+var validation_mix = ee.FeatureCollection(validation_NonDM_c).merge(validation_DM_c);
+
+print('training_mix', training_mix.size());
+print('validation_mix', validation_mix.size());
+
+// 过滤掉空属性的样本
+var training = training_mix.filter(ee.Filter.notNull(training_mix.first().propertyNames()));
+var validation = validation_mix.filter(ee.Filter.notNull(validation_mix.first().propertyNames()));
+
+// ---------------------------
+// 构建训练数据集
+// 将 film‐on 与 film‐off 的影像、纹理以及光谱指数合并
+var dataset = image_1.addBands(image_2)
+              .addBands(glcm_1).addBands(glcm_2)
+              .addBands(ndvi1).addBands(ndbi1).addBands(mndwi1).addBands(savi1).addBands(apgi1).addBands(pghi1).addBands(pgi1).addBands(pmli1).addBands(rpgi1)
+              .addBands(ndvi2).addBands(ndbi2).addBands(mndwi2).addBands(savi2).addBands(apgi2).addBands(pghi2).addBands(pgi2).addBands(pmli2).addBands(rpgi2);
+print("dataset", dataset);
+var dataset_clip = dataset.clip(geometry);
+print("dataset_clip", dataset_clip);
+
+// ---------------------------------------------------------------------------
+// 分类与导出
+function execution_code() {
+  Map.addLayer(geometry);
+  
+  // 提取训练样本对应的影像特征
+  var training_RF = dataset_clip.sampleRegions({
+    collection: training,
+    properties: ['landcover'],
+    scale: 30,
+    tileScale: 8
+  });
+  // print('training_RF_' + inputGrid + '_' + inputSubGrid + ':', training_RF);
+  
+  // 使用随机森林分类器训练模型（参数可根据需要调整）
+  var classifier = ee.Classifier.smileRandomForest(150, 4).train(training_RF, 'landcover');
+  
+  // 对数据集进行分类
+  var classified = dataset_clip.clip(geometry).classify(classifier);
+  
+  // 定义分类显示调色板（例如：0－白色，1－蓝绿色）
+  var palette = ['#ffffff', '#00f5ff'];
+  Map.addLayer(classified, {min: 0, max: 1, palette: palette}, 'DM Classification_' + grid_id + '_' + subgrid_id);
+  
+  // 验证样本
+  var validation_RF = dataset_clip.sampleRegions({
+    collection: validation,
+    properties: ['landcover'],
+    scale: 30,
+    tileScale: 8
+  });
+  print('validation_RF_' + grid_id + '_' + subgrid_id + ':', validation_RF);
+  
+  var validated = validation_RF.classify(classifier, 'testlandcover');
+  var testAccuracy = validated.errorMatrix('landcover', 'testlandcover');
+  print('Validation error matrix_' + grid_id + '_' + subgrid_id + ': ', testAccuracy);
+  print('Validation overall accuracy_' + grid_id + '_' + subgrid_id + ': ', testAccuracy.accuracy());
+  
+  // ----------------------------------------------------------
+  // ----------- Export Classification Results ----------------
+  // ----------------------------------------------------------
+  
+  Export.image.toDrive({
+    image:classified,
+    folder: '2025_PMFClassificationResult',
+    description: geo_name + '_' + start_1 + '_TO_' + end_1 + '_AND_T2-' + start_2 + '_TO_' + end_2 + '_Result',
+    fileNamePrefix: geo_name + '_' + start_1 + '_TO_' + end_1 + '_AND_T2-' + start_2 + '_TO_' + end_2 + '_Result',
+    scale: 10,  // The Spatial Resolultion of the image
+    region:geometry,
+    maxPixels: 1e13
+  });
+}
+
+// 执行主函数
+execution_code();
